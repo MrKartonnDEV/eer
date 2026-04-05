@@ -101,11 +101,13 @@ end
 -- Setup footsteps for a character
 local function setupCharacter(player, character)
 	local humanoid = character:WaitForChild("Humanoid")
+	local hrp = character:WaitForChild("HumanoidRootPart")
 	local feet = getFeet(character)
 	if not feet.Left or not feet.Right then return end
 
-	local lastStepPos = { Left = feet.Left.Position, Right = feet.Right.Position }
-	local lastStepTime = { Left = 0, Right = 0 }
+	-- Single shared tracker so left and right MUST alternate
+	local lastStepPos = hrp.Position
+	local lastStepTime = 0
 	local nextFootLeft = true
 
 	if connections[player] then
@@ -117,18 +119,18 @@ local function setupCharacter(player, character)
 		if humanoid.MoveDirection.Magnitude <= 0 then return end
 		if humanoid.FloorMaterial == Enum.Material.Air then return end
 
-		local footName = nextFootLeft and "Left" or "Right"
-		local footPart = feet[footName]
-
-		-- Horizontal (XZ) distance so slopes don't shorten or stretch step spacing
-		local delta = footPart.Position - lastStepPos[footName]
+		-- Measure horizontal distance traveled since last step (either foot)
+		local delta = hrp.Position - lastStepPos
 		local horizDistance = Vector2.new(delta.X, delta.Z).Magnitude
-		local timeSinceLast = tick() - lastStepTime[footName]
+		local timeSinceLast = tick() - lastStepTime
 
 		if horizDistance >= STEP_DISTANCE and timeSinceLast >= STEP_COOLDOWN then
+			local footName = nextFootLeft and "Left" or "Right"
+			local footPart = feet[footName]
+
 			spawnFootstep(footPart, character)
-			lastStepPos[footName] = footPart.Position
-			lastStepTime[footName] = tick()
+			lastStepPos = hrp.Position
+			lastStepTime = tick()
 			nextFootLeft = not nextFootLeft
 		end
 	end)
