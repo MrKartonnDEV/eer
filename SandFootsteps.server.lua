@@ -1,151 +1,224 @@
+--[[
+	Sand Footsteps (Server-Sided)
+
+	Spawns realistic alternating footprints on any part named "Sand".
+	Works on flat ground and slopes. Handles multiple players.
+	Prints are offset laterally so left/right trails look natural.
+
+	Setup in Roblox Studio:
+	  ReplicatedStorage
+	    └─ Footsteps (Folder)
+	        ├─ FootstepSandLeft  (Part/MeshPart — Anchored, CanCollide off)
+	        └─ FootstepSandRight (Part/MeshPart — Anchored, CanCollide off)
+
+	  If only "FootstepSand" exists it will be used for both feet.
+	  Place this Script in ServerScriptService.
+]]
+
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
 
 local FootstepsFolder = ReplicatedStorage:WaitForChild("Footsteps")
-local FootstepSandTemplate = FootstepsFolder:WaitForChild("FootstepSand")
 
--- CONFIG
-local FOOTSTEP_LIFETIME = 3 -- how long a footstep stays fully visible
-local FOOTSTEP_FADE_TIME = 1 -- fade-out duration after lifetime
-local FOOTSTEP_OFFSET = 0.05 -- offset along surface normal to prevent z-fighting
-local STEP_DISTANCE = 4.5 -- horizontal distance between footsteps (one per stride)
-local STEP_COOLDOWN = 0.35 -- minimum time between steps per foot
-local RAY_LENGTH = 6 -- raycast distance below foot (longer to catch steep slopes)
-local MAX_FOOTSTEPS = 20 -- max active footsteps in workspace at once (prevents buildup)
+----------------------------------------------------------------------
+-- CONFIG — tweak these to taste
+----------------------------------------------------------------------
+local STEP_STRIDE           = 3.2  -- horizontal studs between prints
+local STEP_COOLDOWN         = 0.3  -- min seconds between any two prints
+local PRINT_LIFE            = 5    -- seconds a print stays fully visible
+local FADE_DURATION         = 2    -- fade-out time after life expires
+local SURFACE_OFFSET        = 0.06 -- tiny lift to prevent z-fighting
+local RAY_DISTANCE          = 8    -- how far down to raycast from foot
+local MAX_PRINTS_PER_PLAYER = 30   -- per-player cap (oldest removed first)
+local LATERAL_OFFSET        = 0.5  -- studs to shift print sideways from center
 
-local connections = {}
-local activeFootsteps = {} -- tracks all live footstep instances
+-- Any part whose Name appears here counts as sand
+local SAND_NAMES = {
+	Sand     = true,
+	SandPart = true,
+}
 
--- Get character feet
-local function getFeet(character)
-	return {
-		Left = character:FindFirstChild("LeftFoot") or character:FindFirstChild("Left Leg"),
-		Right = character:FindFirstChild("RightFoot") or character:FindFirstChild("Right Leg"),
-	}
+----------------------------------------------------------------------
+-- TEMPLATE LOOKUP
+----------------------------------------------------------------------
+local function getTemplate(side)
+	return FootstepsFolder:FindFirstChild("FootstepSand" .. side)
+		or FootstepsFolder:FindFirstChild("FootstepSand")
 end
 
--- Spawn a footstep directly below a foot, aligned flush to the surface
-local function spawnFootstep(footPart, character)
-	if not footPart or not footPart.Parent then return end
+----------------------------------------------------------------------
+-- PER-PLAYER DATA
+----------------------------------------------------------------------
+local playerData = {} -- [Player] -> { conn, prints }
 
-	local hrp = character:FindFirstChild("HumanoidRootPart")
-	if not hrp then return end
+----------------------------------------------------------------------
+-- SURFACE MATH
+----------------------------------------------------------------------
 
-	-- Start the ray 1 stud above the foot so we never miss the ground on slopes
-	local rayOrigin = footPart.Position + Vector3.new(0, 1, 0)
-	local rayDirection = Vector3.new(0, -RAY_LENGTH, 0)
-
-	local rayParams = RaycastParams.new()
-	rayParams.FilterDescendantsInstances = {character}
-	rayParams.FilterType = Enum.RaycastFilterType.Exclude
-
-	local result = workspace:Raycast(rayOrigin, rayDirection, rayParams)
-	if not result or result.Instance.Name ~= "Sand" then return end
-
-	local normal = result.Normal
-	local position = result.Position + normal * FOOTSTEP_OFFSET
-
-	-- Use the HumanoidRootPart forward for stable orientation (foot LookVector jitters with animations)
-	local charForward = hrp.CFrame.LookVector
-
-	-- Project the forward vector onto the surface plane so the decal lies flat on slopes
-	local projectedForward = charForward - normal * charForward:Dot(normal)
-
-	-- Fallback when the character looks straight along the normal (rare edge case)
-	if projectedForward.Magnitude < 0.001 then
-		projectedForward = hrp.CFrame.RightVector
-		projectedForward = projectedForward - normal * projectedForward:Dot(normal)
+--- Build a CFrame lying flat on a surface, facing along a direction.
+local function surfaceCFrame(pos, normal, dir)
+	local projected = dir - normal * dir:Dot(normal)
+	if projected.Magnitude < 0.001 then
+		-- dir is nearly parallel to normal — pick an arbitrary tangent
+		local ref = (math.abs(normal.Y) < 0.99) and Vector3.yAxis or Vector3.xAxis
+		projected = ref - normal * ref:Dot(normal)
 	end
-	projectedForward = projectedForward.Unit
+	projected = projected.Unit
+	local right = projected:Cross(normal).Unit
+	return CFrame.fromMatrix(pos, right, normal, -projected)
+end
 
-	local right = projectedForward:Cross(normal).Unit
+--- Raycast straight down, ignoring the character.
+local function castDown(origin, character)
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {character}
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	return workspace:Raycast(origin, Vector3.new(0, -RAY_DISTANCE, 0), params)
+end
 
-	-- Enforce footstep cap: remove the oldest one before spawning a new one
-	while #activeFootsteps >= MAX_FOOTSTEPS do
-		local oldest = table.remove(activeFootsteps, 1)
-		if oldest and oldest.Parent then
-			oldest:Destroy()
-		end
+----------------------------------------------------------------------
+-- PRINT SPAWNING
+----------------------------------------------------------------------
+local function spawnPrint(data, footPart, side, character, moveDir)
+	local template = getTemplate(side)
+	if not template then return end
+
+	-- Ray from slightly above the foot
+	local hit = castDown(footPart.Position + Vector3.yAxis, character)
+	if not hit or not SAND_NAMES[hit.Instance.Name] then return end
+
+	local normal   = hit.Normal
+	local hitPoint = hit.Position + normal * SURFACE_OFFSET
+
+	-- Orient flat on the surface, facing along movement
+	local cf = surfaceCFrame(hitPoint, normal, moveDir)
+
+	-- Shift left or right so the two foot trails don't overlap
+	local shift = (side == "Left") and -LATERAL_OFFSET or LATERAL_OFFSET
+	local finalPos = hitPoint + cf.RightVector * shift
+	cf = surfaceCFrame(finalPos, normal, moveDir)
+
+	-- Clone, position, parent
+	local fp = template:Clone()
+	fp.CFrame      = cf
+	fp.Transparency = 0
+	fp.Anchored     = true
+	fp.CanCollide   = false
+	fp.Parent       = workspace
+
+	-- Track for cap enforcement
+	table.insert(data.prints, fp)
+
+	-- Remove oldest if over the limit
+	while #data.prints > MAX_PRINTS_PER_PLAYER do
+		local old = table.remove(data.prints, 1)
+		if old and old.Parent then old:Destroy() end
 	end
 
-	local footstep = FootstepSandTemplate:Clone()
-	footstep.CFrame = CFrame.fromMatrix(position, right, normal)
-	footstep.Transparency = 0
-	footstep.Parent = workspace
-	table.insert(activeFootsteps, footstep)
+	-- Timed fade-out -> destroy
+	task.delay(PRINT_LIFE, function()
+		if not fp or not fp.Parent then return end
 
-	-- Fade out then destroy
-	task.delay(FOOTSTEP_LIFETIME, function()
-		if footstep and footstep.Parent then
-			local fadeOut = TweenService:Create(
-				footstep,
-				TweenInfo.new(FOOTSTEP_FADE_TIME),
-				{ Transparency = 1 }
-			)
-			fadeOut:Play()
-			fadeOut.Completed:Connect(function()
-				for i, v in ipairs(activeFootsteps) do
-					if v == footstep then
-						table.remove(activeFootsteps, i)
-						break
-					end
+		local tween = TweenService:Create(fp, TweenInfo.new(FADE_DURATION), {
+			Transparency = 1,
+		})
+		tween:Play()
+		tween.Completed:Once(function()
+			for i, v in ipairs(data.prints) do
+				if v == fp then
+					table.remove(data.prints, i)
+					break
 				end
-				footstep:Destroy()
-			end)
-		end
+			end
+			if fp and fp.Parent then fp:Destroy() end
+		end)
 	end)
 end
 
--- Setup footsteps for a character
-local function setupCharacter(player, character)
+----------------------------------------------------------------------
+-- CHARACTER LIFECYCLE
+----------------------------------------------------------------------
+local function onCharacterAdded(player, character)
 	local humanoid = character:WaitForChild("Humanoid")
-	local hrp = character:WaitForChild("HumanoidRootPart")
-	local feet = getFeet(character)
-	if not feet.Left or not feet.Right then return end
+	local hrp      = character:WaitForChild("HumanoidRootPart")
 
-	-- Single shared tracker so left and right MUST alternate
-	local lastStepPos = hrp.Position
-	local lastStepTime = 0
-	local nextFootLeft = true
+	local leftFoot  = character:WaitForChild("LeftFoot", 3)
+		or character:FindFirstChild("Left Leg")
+	local rightFoot = character:WaitForChild("RightFoot", 3)
+		or character:FindFirstChild("Right Leg")
+	if not leftFoot or not rightFoot then return end
 
-	if connections[player] then
-		connections[player]:Disconnect()
+	-- Tear down previous connection if the character respawned
+	if playerData[player] and playerData[player].conn then
+		playerData[player].conn:Disconnect()
 	end
 
-	connections[player] = RunService.Heartbeat:Connect(function()
-		if not character.Parent then return end
-		if humanoid.MoveDirection.Magnitude <= 0 then return end
+	local data = { conn = nil, prints = {} }
+	playerData[player] = data
+
+	local lastStepPos  = hrp.Position
+	local lastStepTime = tick()
+	local nextLeft     = true
+
+	data.conn = RunService.Heartbeat:Connect(function()
+		if not character.Parent or not hrp.Parent then return end
+
+		local moveDir = humanoid.MoveDirection
+		if moveDir.Magnitude < 0.1 then return end
 		if humanoid.FloorMaterial == Enum.Material.Air then return end
 
-		-- Measure horizontal distance traveled since last step (either foot)
+		-- Horizontal distance since last print
 		local delta = hrp.Position - lastStepPos
-		local horizDistance = Vector2.new(delta.X, delta.Z).Magnitude
-		local timeSinceLast = tick() - lastStepTime
+		local hDist = Vector2.new(delta.X, delta.Z).Magnitude
 
-		if horizDistance >= STEP_DISTANCE and timeSinceLast >= STEP_COOLDOWN then
-			local footName = nextFootLeft and "Left" or "Right"
-			local footPart = feet[footName]
+		if hDist < STEP_STRIDE then return end
+		if (tick() - lastStepTime) < STEP_COOLDOWN then return end
 
-			spawnFootstep(footPart, character)
-			lastStepPos = hrp.Position
-			lastStepTime = tick()
-			nextFootLeft = not nextFootLeft
-		end
+		-- Alternate feet
+		local side     = nextLeft and "Left" or "Right"
+		local footPart = nextLeft and leftFoot or rightFoot
+
+		spawnPrint(data, footPart, side, character, moveDir)
+
+		lastStepPos  = hrp.Position
+		lastStepTime = tick()
+		nextLeft     = not nextLeft
 	end)
 end
 
--- Player connections
-Players.PlayerAdded:Connect(function(player)
+----------------------------------------------------------------------
+-- PLAYER LIFECYCLE
+----------------------------------------------------------------------
+local function onPlayerAdded(player)
 	player.CharacterAdded:Connect(function(character)
-		setupCharacter(player, character)
+		onCharacterAdded(player, character)
 	end)
-end)
-
-Players.PlayerRemoving:Connect(function(player)
-	if connections[player] then
-		connections[player]:Disconnect()
-		connections[player] = nil
+	-- If the character already exists (late join / studio quick-start)
+	if player.Character then
+		task.spawn(onCharacterAdded, player, player.Character)
 	end
-end)
+end
+
+local function onPlayerRemoving(player)
+	local data = playerData[player]
+	if not data then return end
+
+	if data.conn then data.conn:Disconnect() end
+
+	-- Destroy all remaining prints for this player
+	for _, fp in ipairs(data.prints) do
+		if fp and fp.Parent then fp:Destroy() end
+	end
+
+	playerData[player] = nil
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(onPlayerRemoving)
+
+-- Catch players already in the game (studio quick-start)
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(onPlayerAdded, player)
+end
