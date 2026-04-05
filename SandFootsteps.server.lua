@@ -7,14 +7,16 @@ local FootstepsFolder = ReplicatedStorage:WaitForChild("Footsteps")
 local FootstepSandTemplate = FootstepsFolder:WaitForChild("FootstepSand")
 
 -- CONFIG
-local FOOTSTEP_LIFETIME = 1.75
-local FOOTSTEP_FADE_TIME = 0.5
+local FOOTSTEP_LIFETIME = 3 -- how long a footstep stays fully visible
+local FOOTSTEP_FADE_TIME = 1 -- fade-out duration after lifetime
 local FOOTSTEP_OFFSET = 0.05 -- offset along surface normal to prevent z-fighting
-local STEP_DISTANCE = 2 -- horizontal distance between footsteps
-local STEP_COOLDOWN = 0.25 -- minimum time between steps per foot
+local STEP_DISTANCE = 4.5 -- horizontal distance between footsteps (one per stride)
+local STEP_COOLDOWN = 0.35 -- minimum time between steps per foot
 local RAY_LENGTH = 6 -- raycast distance below foot (longer to catch steep slopes)
+local MAX_FOOTSTEPS = 20 -- max active footsteps in workspace at once (prevents buildup)
 
 local connections = {}
+local activeFootsteps = {} -- tracks all live footstep instances
 
 -- Get character feet
 local function getFeet(character)
@@ -60,10 +62,19 @@ local function spawnFootstep(footPart, character)
 
 	local right = projectedForward:Cross(normal).Unit
 
+	-- Enforce footstep cap: remove the oldest one before spawning a new one
+	while #activeFootsteps >= MAX_FOOTSTEPS do
+		local oldest = table.remove(activeFootsteps, 1)
+		if oldest and oldest.Parent then
+			oldest:Destroy()
+		end
+	end
+
 	local footstep = FootstepSandTemplate:Clone()
 	footstep.CFrame = CFrame.fromMatrix(position, right, normal)
 	footstep.Transparency = 0
 	footstep.Parent = workspace
+	table.insert(activeFootsteps, footstep)
 
 	-- Fade out then destroy
 	task.delay(FOOTSTEP_LIFETIME, function()
@@ -75,6 +86,12 @@ local function spawnFootstep(footPart, character)
 			)
 			fadeOut:Play()
 			fadeOut.Completed:Connect(function()
+				for i, v in ipairs(activeFootsteps) do
+					if v == footstep then
+						table.remove(activeFootsteps, i)
+						break
+					end
+				end
 				footstep:Destroy()
 			end)
 		end
