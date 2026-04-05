@@ -25,8 +25,8 @@ local FootstepsFolder = ReplicatedStorage:WaitForChild("Footsteps")
 ----------------------------------------------------------------------
 -- CONFIG — tweak these to taste
 ----------------------------------------------------------------------
-local STEP_STRIDE           = 3.2  -- horizontal studs between prints
-local STEP_COOLDOWN         = 0.3  -- min seconds between any two prints
+local STEP_STRIDE           = 2    -- horizontal studs between prints
+local STEP_COOLDOWN         = 0.15 -- min seconds between any two prints
 local PRINT_LIFE            = 5    -- seconds a print stays fully visible
 local FADE_DURATION         = 2    -- fade-out time after life expires
 local SURFACE_OFFSET        = 0.06 -- tiny lift to prevent z-fighting
@@ -85,8 +85,9 @@ local function spawnPrint(data, footPart, side, character, moveDir)
 	local template = getTemplate(side)
 	if not template then return end
 
-	-- Ray from slightly above the foot
-	local hit = castDown(footPart.Position + Vector3.yAxis, character)
+	-- Raycast from the foot's bottom to place the print exactly where the sole is
+	local footBottom = footPart.Position - Vector3.new(0, footPart.Size.Y * 0.5, 0)
+	local hit = castDown(footBottom + Vector3.yAxis * 0.5, character)
 	if not hit or not SAND_NAMES[hit.Instance.Name] then return end
 
 	local normal   = hit.Normal
